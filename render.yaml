@@ -2,15 +2,15 @@ services:
   - type: web
     name: plantcare-moderation
     env: docker
-    repo: <Pavandhanush123>/<Plantcare_backend>
+    repo: Pavandhanush123/Plantcare_backend
     branch: main
     dockerfilePath: Dockerfile
     buildCommand: ""
     startCommand: ""
     envVars:
-      - key: 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
+      - key: HF_TOKEN
         value: ""
-      - key: b1f7c2d3a9e84f6b8c2d4ea19b3f6c7a9d8e2f3b4c5a6d7e8f9a0b1c2d3e4f5
+      - key: MOD_API_KEY
         value: ""
     autoDeploy: true
     healthCheckPath: /health
