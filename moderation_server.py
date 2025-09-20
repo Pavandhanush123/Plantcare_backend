@@ -10,8 +10,8 @@ import requests
 LOG = logging.getLogger("moderation_server")
 logging.basicConfig(level=logging.INFO)
 
-HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-MOD_API_KEY = os.environ.get("MOD_API_KEY", "").strip()
+HF_TOKEN = os.environ.get("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", "").strip()
+MOD_API_KEY = os.environ.get("b1f7c2d3a9e84f6b8c2d4ea19b3f6c7a9d8e2f3b4c5a6d7e8f9a0b1c2d3e4f5", "").strip()
 # HF router endpoint — change if you use another model
 HF_API_URL = os.environ.get(
     "HF_API_URL",
