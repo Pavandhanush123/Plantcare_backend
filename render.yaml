@@ -9,10 +9,8 @@ services:
     startCommand: ""
     envVars:
       - key: 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
-        fromDatabase: false
         value: ""
       - key: b1f7c2d3a9e84f6b8c2d4ea19b3f6c7a9d8e2f3b4c5a6d7e8f9a0b1c2d3e4f5
-        fromDatabase: false
         value: ""
     autoDeploy: true
     healthCheckPath: /health
