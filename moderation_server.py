@@ -1,151 +1,149 @@
 # moderation_server.py
 import os
+import io
 import json
 import logging
-from typing import Tuple, Any
+from typing import Any, Dict
+from flask import Flask, request, jsonify, abort
 import requests
-from fastapi import FastAPI, File, UploadFile, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 
+LOG = logging.getLogger("moderation_server")
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("moderation_server")
 
-app = FastAPI(title="Image Moderation Proxy")
-
-# Simple CORS: adjust origin in production
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # in production restrict origins
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+MOD_API_KEY = os.environ.get("MOD_API_KEY", "").strip()
+# HF router endpoint — change if you use another model
+HF_API_URL = os.environ.get(
+    "HF_API_URL",
+    "https://router.huggingface.co/hf-inference/models/LukeJacob2023/nsfw-image-detector",
 )
 
-# Environment config
-HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-SERVER_API_KEY = os.environ.get("MODERATION_API_KEY", "").strip()
-HF_MODEL = os.environ.get("HF_MODEL", "LukeJacob2023/nsfw-image-detector")
-HF_ENDPOINT = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
-SCORE_THRESHOLD = float(os.environ.get("SCORE_THRESHOLD", "0.60"))  # block if NSFW score >= threshold
-
 if not HF_TOKEN:
-    logger.warning("HF_TOKEN is not set; HF moderation requests will fail (use for test only).")
+    LOG.warning("HF_TOKEN not set — moderation calls will fail if HF_API_URL is used.")
 
-if not SERVER_API_KEY:
-    logger.warning("MODERATION_API_KEY is not set; server will still accept requests that don't provide an API key. Set it for production!")
+app = Flask(__name__)
 
-def hf_call_image(bytes_data: bytes) -> Any:
-    """Call Hugging Face inference for an image; returns decoded JSON."""
-    headers = {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/octet-stream"}
-    # Some HF models want raw bytes with Content-Type image/jpeg, others accept octet-stream.
-    # We'll pass bytes as a POST body.
-    res = requests.post(HF_ENDPOINT, headers=headers, data=bytes_data, timeout=30)
-    try:
-        body = res.json()
-    except Exception:
-        body = {"raw_text": res.text}
-    if res.status_code != 200:
-        raise Exception(f"HF API {res.status_code}: {body}")
-    return body
+def require_api_key():
+    """Return 401 if MOD_API_KEY is configured and request does not provide the correct bearer token."""
+    if not MOD_API_KEY:
+        return  # no server-side key configured -> allow (not recommended for production)
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        abort(401, description="Missing Authorization header")
+    token = auth.split(" ", 1)[1].strip()
+    if token != MOD_API_KEY:
+        abort(401, description="Invalid API key")
 
-def parse_hf_response(resp: Any) -> Tuple[float, str]:
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "moderation_enabled": bool(HF_TOKEN)})
+
+@app.route("/moderate", methods=["POST"])
+def moderate():
     """
-    Very small heuristic to extract 'NSFW' confidence and a label from common HF model responses.
-    Returns (nsfw_score, label). nsfw_score in [0.0,1.0]. If no info found, returns (0.0, 'unknown').
+    POST /moderate
+      - Headers: Authorization: Bearer <MOD_API_KEY>  (if MOD_API_KEY set)
+      - Form: file=@image.jpg
+    Response:
+      { allowed: bool, reason: str, raw: <model response> }
     """
-    try:
-        # Case 1: list of {label,score}
-        if isinstance(resp, list) and len(resp) > 0:
-            for item in resp:
-                lbl = str(item.get("label", "")).lower()
-                sc = float(item.get("score", item.get("confidence", 0.0) or 0.0))
-                # If label suggests NSFW or porn, return score
-                if any(k in lbl for k in ("nsfw", "porn", "sexual", "explicit", "racy", "sexy", "pornography")):
-                    return sc, item.get("label", "")
-            # fallback: pick highest score item
-            best = max(resp, key=lambda it: float(it.get("score", 0.0)))
-            return float(best.get("score", 0.0)), best.get("label", "")
-        # Case 2: dict with keys
-        if isinstance(resp, dict):
-            # models sometimes return {'label': 'NSFW', 'score': 0.95}
-            if "label" in resp and "score" in resp:
-                return float(resp["score"]), str(resp["label"])
-            # some return {'nsfw_score': 0.98}
-            for k in ("nsfw_score", "porn_score", "probabilities", "predictions"):
-                if k in resp:
-                    v = resp[k]
-                    if isinstance(v, (int, float)):
-                        return float(v), k
-                    if isinstance(v, dict):
-                        # try to find 'nsfw' key inside
-                        if "nsfw" in v:
-                            return float(v["nsfw"]), "nsfw"
-            # unknown dict structure: flatten numbers > 0.5 as candidate
-            def find_numeric(d):
-                if isinstance(d, dict):
-                    for kk, vv in d.items():
-                        if isinstance(vv, (int, float)):
-                            if vv > 0:
-                                return float(vv), kk
-                        if isinstance(vv, dict):
-                            ret = find_numeric(vv)
-                            if ret:
-                                return ret
-                return None
-            found = find_numeric(resp)
-            if found:
-                return found
-    except Exception as e:
-        logger.exception("parse_hf_response error: %s", e)
-    return 0.0, "unknown"
+    require_api_key()
 
-@app.post("/moderate")
-async def moderate_endpoint(
-    request: Request,
-    file: UploadFile = File(...),
-    authorization: str | None = Header(None),
-):
-    # Basic API key check
-    if SERVER_API_KEY:
-        if not authorization:
-            raise HTTPException(status_code=401, detail="Authorization header required")
-        # Accept either 'Bearer <key>' or raw key
-        token = authorization.strip()
-        if token.lower().startswith("bearer "):
-            token = token.split(" ", 1)[1].strip()
-        if token != SERVER_API_KEY:
-            raise HTTPException(status_code=403, detail="Invalid API key")
+    if "file" not in request.files:
+        return jsonify({"error": "Missing file field (multipart/form-data)"}), 400
 
-    content = await file.read()
+    f = request.files["file"]
+    content = f.read()
     if not content:
-        raise HTTPException(status_code=400, detail="Empty file")
+        return jsonify({"error": "Empty file"}), 400
 
-    # call HF
+    # forward to Hugging Face router
     if not HF_TOKEN:
-        raise HTTPException(status_code=500, detail="Server not configured with HF_TOKEN")
+        # If HF not configured, treat as unmoderated allowed (but you can change to block)
+        return jsonify({"allowed": True, "reason": "Moderation disabled (HF_TOKEN not configured)", "raw": None})
 
     try:
-        hf_resp = hf_call_image(content)
+        headers = {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/octet-stream"}
+        resp = requests.post(HF_API_URL, headers=headers, data=content, timeout=25)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        LOG.exception("Failed to call HF inference")
+        return jsonify({"allowed": False, "reason": f"HuggingFace request failed: {e}", "raw": None}), 502
+
+    try:
+        model_output = resp.json()
+    except Exception:
+        model_output = resp.text
+
+    interpreted = interpret_hf_response(model_output)
+    # Return both interpreted decision and raw model output for debugging
+    return jsonify({"allowed": interpreted.allowed, "reason": interpreted.message, "raw": model_output})
+
+# Simple container for moderation result
+class ModerationResult:
+    def __init__(self, allowed: bool, message: str):
+        self.allowed = allowed
+        self.message = message
+
+def interpret_hf_response(raw: Any) -> ModerationResult:
+    """
+    Heuristics to interpret different HF model response shapes.
+    Block if:
+      - model returns top label 'nsfw'/'porn'/'adult' with high score (>= 0.6)
+      - model returns a dict of class probabilities where any adult-like class >= 0.6
+    Otherwise allow.
+    """
+    # If raw is string, we can't interpret -> allow but warn
+    if raw is None:
+        return ModerationResult(True, "No model output")
+
+    # If HF router returns a list with single dict (common)
+    if isinstance(raw, list) and raw:
+        raw = raw[0]
+
+    # Common simple object: { "label": "nsfw", "score": 0.97 }
+    try:
+        if isinstance(raw, dict):
+            # case 1: direct label + score
+            label = raw.get("label") or raw.get("category") or None
+            score = raw.get("score") or raw.get("probability") or None
+            if label and isinstance(label, str) and score is not None:
+                label_l = label.lower()
+                try:
+                    score_f = float(score)
+                except Exception:
+                    score_f = 0.0
+                if label_l in ("nsfw", "porn", "adult", "risky") and score_f >= 0.6:
+                    return ModerationResult(False, f"Blocked by model label='{label}' score={score_f:.2f}")
+                return ModerationResult(True, f"Allowed by label='{label}' score={score_f:.2f}")
+
+            # case 2: probability map like {"porn":0.8,"neutral":0.1,...}
+            # pick max probability
+            numeric_map = {k: v for k, v in raw.items() if isinstance(v, (int, float))}
+            if numeric_map:
+                top_k, top_v = max(numeric_map.items(), key=lambda kv: kv[1])
+                top_k_l = str(top_k).lower()
+                try:
+                    top_v_f = float(top_v)
+                except Exception:
+                    top_v_f = 0.0
+                if top_k_l in ("porn", "nsfw", "adult", "sexual") and top_v_f >= 0.6:
+                    return ModerationResult(False, f"Blocked: predicted {top_k}={top_v_f:.2f}")
+                return ModerationResult(True, f"Allowed: predicted {top_k}={top_v_f:.2f}")
+
+            # case 3: HF outputs deeper nested shapes; try to search for label/score keys
+            # flatten dict strings
+            text = json.dumps(raw).lower()
+            if "nsfw" in text or "porn" in text:
+                # if mentions nsfw but no scores — block conservatively
+                return ModerationResult(False, "Blocked conservatively (nsfw token present in model response)")
     except Exception as e:
-        logger.exception("HF call failed")
-        raise HTTPException(status_code=502, detail=f"Hugging Face inference error: {e}")
+        LOG.exception("interpretation failed: %s", e)
+        return ModerationResult(True, "Unable to interpret model response (allowed)")
 
-    # parse response
-    nsfw_score, label = parse_hf_response(hf_resp)
-    logger.info("HF parsed: label=%s score=%.3f", label, nsfw_score)
+    # fallback: allow and include raw shape note
+    return ModerationResult(True, "Allowed (model output non-conclusive)")
 
-    blocked = nsfw_score >= SCORE_THRESHOLD
-    reason = ""
-    if blocked:
-        reason = f"Blocked: detected '{label}' with score {nsfw_score:.2f} (threshold {SCORE_THRESHOLD})"
-    else:
-        reason = f"Passed: detected '{label}' score {nsfw_score:.2f}"
-
-    return JSONResponse({
-        "allowed": not blocked,
-        "reason": reason,
-        "score": nsfw_score,
-        "label": label,
-        "hf_raw": hf_resp
-    })
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
