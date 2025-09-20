@@ -2,7 +2,7 @@ services:
   - type: web
     name: plantcare-moderation
     env: docker
-    repo: Pavandhanush123/Plantcare_backend
+    repo: https://github.com/Pavandhanush123/Plantcare_backend
     branch: main
     dockerfilePath: Dockerfile
     buildCommand: ""
